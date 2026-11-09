@@ -200,6 +200,9 @@ func main() {
 		Engine:                      engine,
 		Webhook:                     webhookDisp,
 	})
+	// Webhooks leave the process too: reuse the proxy address policy so
+	// private hosts stay reachable while metadata and redirects are refused.
+	webhookDisp.SetTransport(upstream.EgressTransport())
 
 	// 7. Initialize Gateway Proxy Handler
 	gateway := proxy.NewGatewayWithOptions(engine, upstream, traceLogger, proxy.GatewayOptions{

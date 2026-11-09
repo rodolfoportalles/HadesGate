@@ -83,10 +83,8 @@ func NewUpstreamDispatcher(cfg UpstreamConfig) *UpstreamDispatcher {
 	dispatcher.enableEgressScan.Store(cfg.EnableEgressScan)
 	dispatcher.ollamaBaseURL.Store(cfg.OllamaBaseURL)
 	dispatcher.httpClient = &http.Client{
-		Timeout: cfg.Timeout,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+		Timeout:       cfg.Timeout,
+		CheckRedirect: RejectRedirects,
 		Transport: &http.Transport{
 			DialContext:         dispatcher.dialContext,
 			ForceAttemptHTTP2:   true,
