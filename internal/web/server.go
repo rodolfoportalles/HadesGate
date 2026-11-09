@@ -31,6 +31,7 @@ type Server struct {
 	engine                    *anonymizer.Engine
 	gateway                   *proxy.Gateway
 	adminKey                  string
+	bootProxyKey              string
 	providerFingerprintSecret string
 	defaultRateLimit          int
 	fs                        fs.FS
@@ -74,6 +75,12 @@ func (s *Server) SetProviderFingerprintSecret(secret string) {
 // SetDefaultRateLimit preserves the boot-level global limiter across dynamic reloads.
 func (s *Server) SetDefaultRateLimit(limit int) {
 	s.defaultRateLimit = limit
+}
+
+// SetBootProxyKey preserves the boot/env proxy key so clearing the stored key
+// reverts to it instead of leaving the gateway with no usable key.
+func (s *Server) SetBootProxyKey(key string) {
+	s.bootProxyKey = strings.TrimSpace(key)
 }
 
 // SetSecurityPolicy enables atomic hot reload of CORS origins and HTTP security policy.
@@ -577,6 +584,15 @@ func (s *Server) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// effectiveGlobalProxyKey resolves the key that must be active after a reload:
+// the stored value when set, otherwise the boot/env key (explicit clear).
+func (s *Server) effectiveGlobalProxyKey(cfg config.DynamicConfig) string {
+	if key := strings.TrimSpace(cfg.GlobalProxyKey); key != "" {
+		return key
+	}
+	return s.bootProxyKey
+}
+
 func (s *Server) reloadGateway(ctx context.Context) error {
 	if s.store == nil || s.gateway == nil {
 		return nil
@@ -630,7 +646,7 @@ func (s *Server) reloadGateway(ctx context.Context) error {
 		}
 	}
 
-	s.gateway.UpdateDynamicConfig(dynCfg.EntityActions, tenantKeys, tenantPolicies, tenantRateLimits, s.defaultRateLimit, dynCfg.GlobalProxyKey)
+	s.gateway.UpdateDynamicConfig(dynCfg.EntityActions, tenantKeys, tenantPolicies, tenantRateLimits, s.defaultRateLimit, s.effectiveGlobalProxyKey(dynCfg))
 	s.gateway.SetTenantNames(tenantNames)
 	s.gateway.UpdateThresholds(dynCfg.FamilyThresholds, dynCfg.EntityThresholds)
 
