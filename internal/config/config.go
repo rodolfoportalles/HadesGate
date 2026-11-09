@@ -39,6 +39,7 @@ type Config struct {
 	TenantProxyKeys             map[string]string
 	TenantEntityActions         map[string]map[string]string
 	RateLimitPerMinute          int
+	AdminRateLimit              int
 	TenantRateLimits            map[string]int
 	SemanticDetectorEnabled     bool
 	SemanticDetectorURL         string
@@ -100,6 +101,7 @@ func Load() *Config {
 		MaxConcurrentRequests:      128,
 		MaxResponseBytes:           20 << 20,
 		MaxSSEEventBytes:           1 << 20,
+		AdminRateLimit:             120,
 		EntityActions:              make(map[string]string),
 		TenantProxyKeys:            make(map[string]string),
 		TenantEntityActions:        make(map[string]map[string]string),
@@ -269,6 +271,11 @@ func Load() *Config {
 	if val := getEnvAny("HADESGATE_RATE_LIMIT_PER_MINUTE", "PRIVAGATE_RATE_LIMIT_PER_MINUTE"); val != "" {
 		if limit, err := strconv.Atoi(val); err == nil && limit >= 0 {
 			cfg.RateLimitPerMinute = limit
+		}
+	}
+	if val := os.Getenv("HADESGATE_ADMIN_RATE_LIMIT"); val != "" {
+		if limit, err := strconv.Atoi(val); err == nil && limit >= 0 {
+			cfg.AdminRateLimit = limit
 		}
 	}
 	if val := getEnvAny("HADESGATE_TENANT_RATE_LIMITS", "PRIVAGATE_TENANT_RATE_LIMITS"); val != "" {

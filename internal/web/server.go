@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hadesgate/hadesgate/internal/anonymizer"
@@ -39,16 +40,29 @@ type Server struct {
 	webhook                   *webhook.Dispatcher
 	upstream                  *proxy.UpstreamDispatcher
 	securityPolicy            *SecurityPolicy
+	adminLimiter              atomic.Pointer[proxy.RateLimiter]
 }
 
 // NewServer creates a new web Server.
 func NewServer(engine *anonymizer.Engine, gateway *proxy.Gateway, adminKey string, staticFS fs.FS) *Server {
-	return &Server{
+	s := &Server{
 		engine:   engine,
 		gateway:  gateway,
 		adminKey: adminKey,
 		fs:       staticFS,
 	}
+	s.adminLimiter.Store(proxy.NewRateLimiter(defaultAdminRateLimit))
+	return s
+}
+
+// defaultAdminRateLimit bounds the administrative API per minute: enough for
+// the dashboard polling and for a person clicking, low enough that a runaway
+// extension loop cannot stack 2 MB anonymization scans.
+const defaultAdminRateLimit = 120
+
+// SetAdminRateLimit replaces the administrative limiter at boot.
+func (s *Server) SetAdminRateLimit(eventsPerMinute int) {
+	s.adminLimiter.Store(proxy.NewRateLimiter(eventsPerMinute))
 }
 
 // SetStore binds the dynamic configuration store to the server.

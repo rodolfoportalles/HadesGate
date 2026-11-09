@@ -1245,3 +1245,33 @@ func TestServer_ClearingGlobalProxyKeyRevokesItImmediately(t *testing.T) {
 		t.Fatal("boot key is not accepted after clearing the stored key")
 	}
 }
+
+func TestServer_AdminRateLimitAppliesAfterAuth(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	srv, mux := setupTestServer(adminKey)
+	srv.SetAdminRateLimit(2)
+
+	call := func(key string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/vault", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if c := call(adminKey); c != http.StatusOK {
+		t.Fatalf("first call: %d", c)
+	}
+	if c := call(adminKey); c != http.StatusOK {
+		t.Fatalf("second call: %d", c)
+	}
+	if c := call(adminKey); c != http.StatusTooManyRequests {
+		t.Fatalf("third call should be limited, got %d", c)
+	}
+	// An unauthenticated call must not consume the authenticated budget.
+	if c := call(""); c != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated call must still be 401, got %d", c)
+	}
+}

@@ -237,6 +237,7 @@ func main() {
 	webServer.SetProviderFingerprintSecret(cfg.ProviderFingerprintSecret)
 	webServer.SetDefaultRateLimit(cfg.RateLimitPerMinute)
 	webServer.SetBootProxyKey(bootProxyKey)
+	webServer.SetAdminRateLimit(cfg.AdminRateLimit)
 	securityPolicy := web.NewSecurityPolicy(cfg.CORSAllowedOrigins)
 	webServer.SetSecurityPolicy(securityPolicy)
 
