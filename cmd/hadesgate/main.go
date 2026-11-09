@@ -24,6 +24,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	// Capture the boot/env proxy key before the stored configuration below can
+	// replace it: clearing the stored key must revert to this one.
+	bootProxyKey := cfg.ProxyKey
 	configMasterKey, keyErr := config.ParseMasterKey(cfg.ConfigMasterKey)
 	if keyErr != nil {
 		log.Fatalf("configuration encryption unavailable: %v", keyErr)
@@ -233,6 +236,7 @@ func main() {
 	webServer.SetUpstream(upstream)
 	webServer.SetProviderFingerprintSecret(cfg.ProviderFingerprintSecret)
 	webServer.SetDefaultRateLimit(cfg.RateLimitPerMinute)
+	webServer.SetBootProxyKey(bootProxyKey)
 	securityPolicy := web.NewSecurityPolicy(cfg.CORSAllowedOrigins)
 	webServer.SetSecurityPolicy(securityPolicy)
 

@@ -654,9 +654,9 @@ func (g *Gateway) UpdateDynamicConfig(entityActions map[string]string, tenantKey
 
 	g.policy = policy.New(entityActions).WithFamilyResolver(familyResolver)
 	g.tenantKeys = cloneStringMap(tenantKeys)
-	if globalProxyKey != "" {
-		g.globalProxyKey = globalProxyKey
-	}
+	// Assign unconditionally: a cleared key must be revoked immediately
+	// instead of surviving in memory until the next restart.
+	g.globalProxyKey = globalProxyKey
 
 	compiledTenantPolicies := make(map[string]*policy.Engine, len(tenantPolicies))
 	for tenant, actions := range tenantPolicies {
