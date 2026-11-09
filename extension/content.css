@@ -201,3 +201,14 @@
   color: #ff2a2a;
 }
 
+.hg-toast.hg-sticky {
+  cursor: pointer;
+  background: #2a1212;
+  animation: hg-sticky-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes hg-sticky-pulse {
+  0%, 100% { border-color: #ff2a2a; }
+  50% { border-color: #ffd400; }
+}
+
