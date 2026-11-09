@@ -161,3 +161,51 @@ func TestEncryptedBackupExcludesTelemetryAndRestoresCiphertextConfiguration(t *t
 		t.Fatal("admin credential fingerprint was not restored")
 	}
 }
+
+func TestAuditChainDetectsEditionAndDeletion(t *testing.T) {
+	store := newGovernanceTestStore(t)
+	ctx := context.Background()
+
+	record := func(action string) {
+		t.Helper()
+		if err := store.RecordAuditEvent(ctx, AuditEvent{
+			ActorKeyID: "adm_test", ActorRole: RoleAdmin, Action: action, TargetType: "configuration",
+		}); err != nil {
+			t.Fatalf("recording %s: %v", action, err)
+		}
+	}
+	record("configuration.updated")
+	record("tenant.created")
+	record("admin_credential.created")
+
+	report, err := store.VerifyAuditChain(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !report.Valid || report.Events != 3 {
+		t.Fatalf("intact chain must verify: %+v", report)
+	}
+
+	// Editing a row breaks its signature.
+	if _, err := store.db.ExecContext(ctx, `UPDATE governance_audit SET action = 'tenant.deleted' WHERE action = 'tenant.created'`); err != nil {
+		t.Fatal(err)
+	}
+	report, _ = store.VerifyAuditChain(ctx)
+	if report.Valid || !strings.Contains(report.Reason, "edited") {
+		t.Fatalf("edition must be detected: %+v", report)
+	}
+
+	// Rebuild the chain and delete a middle row instead.
+	store2 := newGovernanceTestStore(t)
+	store = store2
+	record("a.first")
+	record("b.middle")
+	record("c.last")
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM governance_audit WHERE action = 'b.middle'`); err != nil {
+		t.Fatal(err)
+	}
+	report, _ = store.VerifyAuditChain(ctx)
+	if report.Valid || !strings.Contains(report.Reason, "deleted") {
+		t.Fatalf("deletion must be detected: %+v", report)
+	}
+}

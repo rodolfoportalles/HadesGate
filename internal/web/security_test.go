@@ -3,6 +3,7 @@ package web
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -159,5 +160,42 @@ func TestSecurityPolicy_HotReloadsCORSOrigins(t *testing.T) {
 	}
 	if got := request("https://old.example"); got.Code != http.StatusForbidden {
 		t.Fatalf("old origin remained allowed after atomic reload: status=%d", got.Code)
+	}
+}
+
+func TestSecurityMiddleware_Headers(t *testing.T) {
+	handler := NewSecurityPolicy(nil).Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/traces", nil))
+
+	if got := rec.Header().Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") || !strings.Contains(got, "frame-ancestors 'none'") {
+		t.Fatalf("missing or weak CSP: %q", got)
+	}
+	if got := rec.Header().Get("Permissions-Policy"); !strings.Contains(got, "camera=()") {
+		t.Fatalf("missing permissions policy: %q", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("API response must not be cached, got %q", got)
+	}
+	if got := rec.Header().Get("Strict-Transport-Security"); got != "" {
+		t.Fatalf("HSTS must not be sent over plain HTTP, got %q", got)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/traces", nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if got := rec.Header().Get("Strict-Transport-Security"); !strings.Contains(got, "max-age=31536000") {
+		t.Fatalf("HSTS missing behind a TLS terminator: %q", got)
+	}
+
+	// Static assets stay cacheable.
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := rec.Header().Get("Cache-Control"); got == "no-store" {
+		t.Fatalf("static asset should not be no-store: %q", got)
 	}
 }

@@ -61,6 +61,7 @@ type AuditEvent struct {
 	Timestamp  time.Time       `json:"timestamp"`
 	Nonce      string          `json:"nonce"`
 	Signature  string          `json:"signature"`
+	PrevHash   string          `json:"prev_hash"`
 }
 
 func (s *Store) initGovernanceSchema(ctx context.Context) error {
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS governance_audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
   actor_key_id TEXT NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL,
   target_type TEXT NOT NULL, target_id TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
-  timestamp TIMESTAMP NOT NULL, nonce TEXT NOT NULL UNIQUE, signature TEXT NOT NULL
+  timestamp TIMESTAMP NOT NULL, nonce TEXT NOT NULL UNIQUE, signature TEXT NOT NULL,
+  prev_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_governance_audit_timestamp ON governance_audit(timestamp DESC);
 CREATE TABLE IF NOT EXISTS telemetry_retention (
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS telemetry_retention (
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("creating governance tables: %w", err)
 	}
+	// Migration for databases created before the hash chain.
+	_, _ = s.db.ExecContext(ctx, "ALTER TABLE governance_audit ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
 	return nil
 }
 
@@ -226,9 +230,20 @@ func (s *Store) DeleteAdminCredential(ctx context.Context, keyID string) error {
 
 func (s *Store) auditSignature(event AuditEvent) string {
 	mac := hmac.New(sha256.New, s.authKey[:])
-	fmt.Fprintf(mac, "%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, event.Timestamp.UTC().Format(time.RFC3339Nano), event.Nonce)
+	fmt.Fprintf(mac, "%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", event.PrevHash, event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, event.Timestamp.UTC().Format(time.RFC3339Nano), event.Nonce)
 	_, _ = mac.Write(event.Metadata)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// lastAuditSignature returns the signature of the newest event, the chain link
+// the next event must reference.
+func (s *Store) lastAuditSignature(ctx context.Context) (string, error) {
+	var signature string
+	err := s.db.QueryRowContext(ctx, `SELECT signature FROM governance_audit ORDER BY seq DESC LIMIT 1`).Scan(&signature)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return signature, err
 }
 
 func (s *Store) RecordAuditEvent(ctx context.Context, event AuditEvent) error {
@@ -259,8 +274,18 @@ func (s *Store) RecordAuditEvent(ctx context.Context, event AuditEvent) error {
 			return err
 		}
 	}
+	// Chain the event to its predecessor so deletions are detectable, not only
+	// in-place edits. Serialized by the store mutex to keep the link stable.
+	s.mu.Lock()
+	previous, err := s.lastAuditSignature(ctx)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("reading previous audit signature: %w", err)
+	}
+	event.PrevHash = previous
 	event.Signature = s.auditSignature(event)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO governance_audit(id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature) VALUES(?,?,?,?,?,?,?,?,?,?)`, event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, string(event.Metadata), event.Timestamp, event.Nonce, event.Signature)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO governance_audit(id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature,prev_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, string(event.Metadata), event.Timestamp, event.Nonce, event.Signature, event.PrevHash)
+	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("recording audit event: %w", err)
 	}
@@ -271,7 +296,7 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature FROM governance_audit ORDER BY seq DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature,prev_hash FROM governance_audit ORDER BY seq DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("listing audit events: %w", err)
 	}
@@ -280,7 +305,7 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 	for rows.Next() {
 		var item AuditEvent
 		var metadata string
-		if err := rows.Scan(&item.ID, &item.ActorKeyID, &item.ActorRole, &item.Action, &item.TargetType, &item.TargetID, &metadata, &item.Timestamp, &item.Nonce, &item.Signature); err != nil {
+		if err := rows.Scan(&item.ID, &item.ActorKeyID, &item.ActorRole, &item.Action, &item.TargetType, &item.TargetID, &metadata, &item.Timestamp, &item.Nonce, &item.Signature, &item.PrevHash); err != nil {
 			return nil, err
 		}
 		item.Metadata = json.RawMessage(metadata)
@@ -396,4 +421,49 @@ func (s *Store) RestoreEncryptedBackup(ctx context.Context, envelope string) err
 		return err
 	}
 	return s.migrateAndValidateSecrets(ctx)
+}
+
+// AuditChainReport is the outcome of an integrity check over the audit trail.
+type AuditChainReport struct {
+	Valid    bool   `json:"valid"`
+	Events   int    `json:"events"`
+	BrokenAt string `json:"broken_at,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// VerifyAuditChain walks the trail in insertion order and reports the first
+// event whose signature does not match its content or whose predecessor link
+// does not point at the previous row. A deleted row breaks the chain.
+func (s *Store) VerifyAuditChain(ctx context.Context) (AuditChainReport, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature,prev_hash FROM governance_audit ORDER BY seq ASC`)
+	if err != nil {
+		return AuditChainReport{}, fmt.Errorf("reading audit chain: %w", err)
+	}
+	defer rows.Close()
+
+	report := AuditChainReport{Valid: true}
+	expectedPrev := ""
+	for rows.Next() {
+		var item AuditEvent
+		var metadata string
+		if err := rows.Scan(&item.ID, &item.ActorKeyID, &item.ActorRole, &item.Action, &item.TargetType, &item.TargetID, &metadata, &item.Timestamp, &item.Nonce, &item.Signature, &item.PrevHash); err != nil {
+			return AuditChainReport{}, err
+		}
+		item.Metadata = json.RawMessage(metadata)
+		report.Events++
+		if item.PrevHash != expectedPrev {
+			report.Valid = false
+			report.BrokenAt = item.ID
+			report.Reason = "missing predecessor: a row was deleted or reordered"
+			return report, nil
+		}
+		if subtle.ConstantTimeCompare([]byte(s.auditSignature(item)), []byte(item.Signature)) != 1 {
+			report.Valid = false
+			report.BrokenAt = item.ID
+			report.Reason = "signature mismatch: a row was edited"
+			return report, nil
+		}
+		expectedPrev = item.Signature
+	}
+	return report, rows.Err()
 }

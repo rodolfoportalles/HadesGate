@@ -85,6 +85,21 @@ func (p *SecurityPolicy) serveHTTP(next http.Handler, cfg *securityConfig, w htt
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-XSS-Protection", "1; mode=block")
 	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+	// The Console keeps the administrative key in sessionStorage, so script
+	// execution is equivalent to credential theft. connect-src stays open
+	// because the gateway URL is user chosen; style-src needs unsafe-inline for
+	// React style attributes. The theme bootstrap is the only inline script.
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; connect-src 'self' http: https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	if isHTTPS(r) {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	}
+	// API responses carry sanitized prompts and configuration state.
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	// AGPL section 13 source offer for browser and API users interacting remotely.
 	w.Header().Set("Link", "<"+sourceCodeURL+">; rel=\"source\"")
 	w.Header().Set("X-HadesGate-License", licenseSPDX)
@@ -99,6 +114,13 @@ func (p *SecurityPolicy) serveHTTP(next http.Handler, cfg *securityConfig, w htt
 	}
 
 	next.ServeHTTP(w, r)
+}
+
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
 }
 
 func parseOrigin(raw string) (*url.URL, error) {

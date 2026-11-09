@@ -13,6 +13,7 @@
     enabled: true,
     interceptPaste: true,
     autoRestore: true,
+    failClosed: true,
     injectDirective: true,
     lang: "pt-BR",
   };
@@ -263,6 +264,52 @@
     }, 3200);
   }
 
+  // Sticky warning used when the gateway fails and failClosed is on: the raw
+  // text must not slip out unnoticed while the user reads the model answer.
+  let stickyToast = null;
+
+  function showStickyWarning(msg) {
+    if (!hudRoot) mountHud();
+    clearStickyWarning();
+    stickyToast = document.createElement("div");
+    stickyToast.className = "hg-toast err hg-sticky";
+    stickyToast.textContent = msg;
+    stickyToast.title = settings.lang === "en" ? "Click to dismiss" : "Clique para dispensar";
+    stickyToast.addEventListener("click", clearStickyWarning);
+    hudRoot.insertBefore(stickyToast, hudRoot.firstChild);
+  }
+
+  function clearStickyWarning() {
+    if (stickyToast) {
+      stickyToast.remove();
+      stickyToast = null;
+    }
+  }
+
+  function failureMessage(errCode) {
+    if (settings.lang === "en") {
+      if (settings.failClosed) {
+        return `[ HADESGATE // ${errCode} ] RAW TEXT INSERTED, NOT PROTECTED`;
+      }
+      return `[ HADESGATE // ${errCode} ]`;
+    }
+    if (settings.failClosed) {
+      return `[ HADESGATE // ${errCode} ] TEXTO CRU INSERIDO, SEM PROTEÇÃO`;
+    }
+    return `[ HADESGATE // ${errCode} ]`;
+  }
+
+  // Inserts the raw text after a failed anonymization. With failClosed the
+  // failure stays visible until the next success or an explicit dismissal.
+  function insertAfterFailure(target, rawText, errCode) {
+    writeEditableText(target, rawText, false);
+    if (settings.failClosed) {
+      showStickyWarning(failureMessage(errCode));
+      return;
+    }
+    showToast(failureMessage(errCode), true);
+  }
+
   // ---------------------------------------------------------------------------
   // DETECÇÃO E MANIPULAÇÃO DO INPUT DE CHAT (TEXTAREA & PROSEMIRROR/QUILL)
   // ---------------------------------------------------------------------------
@@ -418,18 +465,11 @@
           }
 
           if (chrome.runtime.lastError || !res || !res.ok) {
-            // Degradação segura: insere o texto original e avisa o usuário
-            writeEditableText(editableRoot, rawText, false);
-            const errCode = res?.error || "OFFLINE";
-            showToast(
-              errCode === "MISSING_API_KEY"
-                ? "[ HADESGATE // CONFIGURE A CHAVE NA EXTENSÃO ]"
-                : `[ HADESGATE // ${errCode} ]`,
-              true
-            );
+            insertAfterFailure(editableRoot, rawText, res?.error || "OFFLINE");
             return;
           }
 
+          clearStickyWarning();
           const entities = res.entities || [];
           if (entities.length === 0) {
             writeEditableText(editableRoot, rawText, false);
@@ -501,15 +541,11 @@
         }
 
         if (chrome.runtime.lastError || !res || !res.ok) {
-          const errCode = res?.error || "OFFLINE";
-          showToast(
-            errCode === "MISSING_API_KEY"
-              ? "[ HADESGATE // CONFIGURE A CHAVE NA EXTENSÃO ]"
-              : `[ HADESGATE // ${errCode} ]`,
-            true
-          );
+          insertAfterFailure(inputEl, rawText, res?.error || "OFFLINE");
           return;
         }
+
+        clearStickyWarning();
 
         const entities = res.entities || [];
         if (entities.length === 0) {

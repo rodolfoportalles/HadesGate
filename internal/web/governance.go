@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,7 +18,11 @@ func (s *Server) auditChange(r *http.Request, action, targetType, targetID strin
 	}
 	principal := principalFromRequest(r)
 	encoded, _ := json.Marshal(metadata)
-	_ = s.store.RecordAuditEvent(r.Context(), config.AuditEvent{ActorKeyID: principal.KeyID, ActorRole: principal.Role, Action: action, TargetType: targetType, TargetID: targetID, Metadata: encoded})
+	if err := s.store.RecordAuditEvent(r.Context(), config.AuditEvent{ActorKeyID: principal.KeyID, ActorRole: principal.Role, Action: action, TargetType: targetType, TargetID: targetID, Metadata: encoded}); err != nil {
+		// The change itself succeeded; make the lost audit visible instead of
+		// pretending the trail is complete.
+		log.Printf("⚠️  [AUDIT] could not record %s on %s/%s: %v", action, targetType, targetID, err)
+	}
 }
 
 func (s *Server) handleAdminCredentials(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +185,21 @@ func (s *Server) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("download") == "1" {
 		w.Header().Set("Content-Disposition", `attachment; filename="hadesgate-audit.json"`)
 	}
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"version": 1, "events": events})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"version": 2, "events": events})
+}
+
+func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":{"message":"Method not allowed"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	report, err := s.store.VerifyAuditChain(r.Context())
+	if err != nil {
+		http.Error(w, `{"error":{"message":"Failed to verify the audit chain"}}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
 }
 
 func (s *Server) handleConfigBackup(w http.ResponseWriter, r *http.Request) {
