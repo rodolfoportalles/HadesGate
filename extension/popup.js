@@ -22,6 +22,8 @@ const I18N = {
     swPasteDesc: "Mascara CPF, PIX, senhas e chaves automaticamente ao colar",
     swRestoreTitle: "AUTO-RESTAURAR RESPOSTAS NA TELA",
     swRestoreDesc: "Substitui tokens [HG_...] pelos dados reais no DOM da conversa",
+    swFailClosedTitle: "BLOQUEAR SE O GATEWAY FALHAR",
+    swFailClosedDesc: "Não deixa enviar texto cru quando o gateway está fora ou recusa",
     swDirectiveTitle: "DIRETIVA ANTI-RECUSA IA",
     swDirectiveDesc: "Instrui a IA web a tratar tokens como dados reais preenchidos",
     sbInputLabel: "TEXTO BRUTO // ÁREA DE TRANSFERÊNCIA",
@@ -60,6 +62,8 @@ const I18N = {
     swPasteDesc: "Automatically masks CPF, PIX, passwords and keys on paste",
     swRestoreTitle: "AUTO-RESTORE DOM RESPONSES",
     swRestoreDesc: "Replaces [HG_...] tokens with original values in chat replies",
+    swFailClosedTitle: "BLOCK WHEN THE GATEWAY FAILS",
+    swFailClosedDesc: "Do not send raw text when the gateway is down or refuses",
     swDirectiveTitle: "AI ANTI-REFUSAL DIRECTIVE",
     swDirectiveDesc: "Instructs web LLMs to treat tokens as valid filled values",
     sbInputLabel: "RAW TEXT // CLIPBOARD SANDBOX",
@@ -179,6 +183,7 @@ function saveSettings() {
     enabled: el("swEnabled").checked,
     interceptPaste: el("swPaste").checked,
     autoRestore: el("swRestore").checked,
+    failClosed: el("swFailClosed").checked,
     injectDirective: el("swDirective").checked,
     lang: currentLang,
     theme: currentTheme,
@@ -193,6 +198,7 @@ document.addEventListener("DOMContentLoaded", () => {
       enabled: true,
       interceptPaste: true,
       autoRestore: true,
+      failClosed: true,
       injectDirective: true,
       lang: "pt-BR",
       theme: "dark",
@@ -203,6 +209,7 @@ document.addEventListener("DOMContentLoaded", () => {
       el("swEnabled").checked = Boolean(items.enabled);
       el("swPaste").checked = Boolean(items.interceptPaste);
       el("swRestore").checked = Boolean(items.autoRestore);
+      el("swFailClosed").checked = Boolean(items.failClosed);
       el("swDirective").checked = Boolean(items.injectDirective);
       currentLang = items.lang || "pt-BR";
       currentTheme = items.theme || "dark";
@@ -249,7 +256,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // Switches
-  ["swEnabled", "swPaste", "swRestore", "swDirective"].forEach((id) => {
+  ["swEnabled", "swPaste", "swRestore", "swFailClosed", "swDirective"].forEach((id) => {
     el(id).addEventListener("change", saveSettings);
   });
 

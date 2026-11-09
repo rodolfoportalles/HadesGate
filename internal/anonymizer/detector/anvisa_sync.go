@@ -16,7 +16,12 @@ import (
 	"unicode"
 )
 
-const DefaultAnvisaEndpoint = "https://dados.anvisa.gov.br/dados/DADOS_ABERTOS_MEDICAMENTOS.csv"
+const (
+	DefaultAnvisaEndpoint = "https://dados.anvisa.gov.br/dados/DADOS_ABERTOS_MEDICAMENTOS.csv"
+	// maxAnvisaCSVBytes bounds a streamed refresh so a runaway response cannot
+	// exhaust memory.
+	maxAnvisaCSVBytes = 256 << 20
+)
 
 // AnvisaSyncResult represents the outcome of an ANVISA catalog synchronization check.
 type AnvisaSyncResult struct {
@@ -115,7 +120,7 @@ func (s *AnvisaSynchronizer) CheckAndSync(ctx context.Context, force bool) (*Anv
 		return nil, fmt.Errorf("anvisa stream returned HTTP status %d", getResp.StatusCode)
 	}
 
-	reader := csv.NewReader(getResp.Body)
+	reader := csv.NewReader(io.LimitReader(getResp.Body, maxAnvisaCSVBytes))
 	reader.Comma = ';'
 	reader.LazyQuotes = true
 
@@ -226,4 +231,3 @@ func persistCompactCatalog(path string, terms []string) error {
 
 	return os.WriteFile(path, buf.Bytes(), 0o600)
 }
-

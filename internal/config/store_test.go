@@ -395,3 +395,27 @@ func TestStore_ClearWebhookAndThresholdPersistence(t *testing.T) {
 		t.Fatalf("expected cleared webhook secret, got %q", cleared.WebhookSecret)
 	}
 }
+
+func TestTenantIDValidation(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	store, err := NewStore(db, testConfigMasterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, id := range []string{"financeiro", "01", "team_a-b"} {
+		if _, err := store.SaveTenant(ctx, TenantConfig{ID: id, Name: id, ProxyKey: "k-" + id}); err != nil {
+			t.Fatalf("valid id %q rejected: %v", id, err)
+		}
+	}
+	for _, id := range []string{"with space", "a/b", "acentuação"} {
+		if _, err := store.SaveTenant(ctx, TenantConfig{ID: id, Name: id, ProxyKey: "k"}); err == nil {
+			t.Fatalf("invalid id %q accepted", id)
+		}
+	}
+}

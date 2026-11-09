@@ -120,6 +120,11 @@ func NewSQLiteTraceLogger(dbPath string, maxRows int) (*TraceLogger, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if trimmedPath != ":memory:" {
+		// The database holds encrypted secrets, fingerprints and traces; keep it
+		// owner-only regardless of the process umask.
+		_ = os.Chmod(trimmedPath, 0o600)
+	}
 
 	return &TraceLogger{
 		db:      db,

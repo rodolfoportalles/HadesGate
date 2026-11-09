@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS = {
   enabled: true,
   interceptPaste: true,
   autoRestore: true,
+  failClosed: true,
   injectDirective: true,
   lang: "pt-BR",
   theme: "dark",

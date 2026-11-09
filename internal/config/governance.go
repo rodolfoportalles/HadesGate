@@ -61,6 +61,7 @@ type AuditEvent struct {
 	Timestamp  time.Time       `json:"timestamp"`
 	Nonce      string          `json:"nonce"`
 	Signature  string          `json:"signature"`
+	PrevHash   string          `json:"prev_hash"`
 }
 
 func (s *Store) initGovernanceSchema(ctx context.Context) error {
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS governance_audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
   actor_key_id TEXT NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL,
   target_type TEXT NOT NULL, target_id TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
-  timestamp TIMESTAMP NOT NULL, nonce TEXT NOT NULL UNIQUE, signature TEXT NOT NULL
+  timestamp TIMESTAMP NOT NULL, nonce TEXT NOT NULL UNIQUE, signature TEXT NOT NULL,
+  prev_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_governance_audit_timestamp ON governance_audit(timestamp DESC);
 CREATE TABLE IF NOT EXISTS telemetry_retention (
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS telemetry_retention (
 	if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("creating governance tables: %w", err)
 	}
+	// Migration for databases created before the hash chain.
+	_, _ = s.db.ExecContext(ctx, "ALTER TABLE governance_audit ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
 	return nil
 }
 
@@ -226,9 +230,20 @@ func (s *Store) DeleteAdminCredential(ctx context.Context, keyID string) error {
 
 func (s *Store) auditSignature(event AuditEvent) string {
 	mac := hmac.New(sha256.New, s.authKey[:])
-	fmt.Fprintf(mac, "%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, event.Timestamp.UTC().Format(time.RFC3339Nano), event.Nonce)
+	fmt.Fprintf(mac, "%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s", event.PrevHash, event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, event.Timestamp.UTC().Format(time.RFC3339Nano), event.Nonce)
 	_, _ = mac.Write(event.Metadata)
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// lastAuditSignature returns the signature of the newest event, the chain link
+// the next event must reference.
+func (s *Store) lastAuditSignature(ctx context.Context) (string, error) {
+	var signature string
+	err := s.db.QueryRowContext(ctx, `SELECT signature FROM governance_audit ORDER BY seq DESC LIMIT 1`).Scan(&signature)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return signature, err
 }
 
 func (s *Store) RecordAuditEvent(ctx context.Context, event AuditEvent) error {
@@ -259,8 +274,18 @@ func (s *Store) RecordAuditEvent(ctx context.Context, event AuditEvent) error {
 			return err
 		}
 	}
+	// Chain the event to its predecessor so deletions are detectable, not only
+	// in-place edits. Serialized by the store mutex to keep the link stable.
+	s.mu.Lock()
+	previous, err := s.lastAuditSignature(ctx)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("reading previous audit signature: %w", err)
+	}
+	event.PrevHash = previous
 	event.Signature = s.auditSignature(event)
-	_, err = s.db.ExecContext(ctx, `INSERT INTO governance_audit(id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature) VALUES(?,?,?,?,?,?,?,?,?,?)`, event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, string(event.Metadata), event.Timestamp, event.Nonce, event.Signature)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO governance_audit(id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature,prev_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, event.ID, event.ActorKeyID, event.ActorRole, event.Action, event.TargetType, event.TargetID, string(event.Metadata), event.Timestamp, event.Nonce, event.Signature, event.PrevHash)
+	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("recording audit event: %w", err)
 	}
@@ -271,7 +296,7 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature FROM governance_audit ORDER BY seq DESC LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature,prev_hash FROM governance_audit ORDER BY seq DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("listing audit events: %w", err)
 	}
@@ -280,7 +305,7 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 	for rows.Next() {
 		var item AuditEvent
 		var metadata string
-		if err := rows.Scan(&item.ID, &item.ActorKeyID, &item.ActorRole, &item.Action, &item.TargetType, &item.TargetID, &metadata, &item.Timestamp, &item.Nonce, &item.Signature); err != nil {
+		if err := rows.Scan(&item.ID, &item.ActorKeyID, &item.ActorRole, &item.Action, &item.TargetType, &item.TargetID, &metadata, &item.Timestamp, &item.Nonce, &item.Signature, &item.PrevHash); err != nil {
 			return nil, err
 		}
 		item.Metadata = json.RawMessage(metadata)
@@ -291,9 +316,74 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 
 type backupRow map[string]interface{}
 type backupPayload struct {
-	Version int                    `json:"version"`
-	Created time.Time              `json:"created_at"`
-	Tables  map[string][]backupRow `json:"tables"`
+	Version    int                    `json:"version"`
+	InstanceID string                 `json:"instance_id"`
+	Created    time.Time              `json:"created_at"`
+	Tables     map[string][]backupRow `json:"tables"`
+}
+
+// backupTableColumns is the contract a backup must satisfy. A payload missing a
+// table or a column is rejected before anything is deleted.
+var backupTableColumns = map[string][]string{
+	"system_config":        {"key", "value", "updated_at"},
+	"tenants":              {"id", "name", "proxy_key", "rate_limit", "entity_actions", "updated_at"},
+	"provider_credentials": {"id", "tenant_id", "provider", "label", "key_hint", "fingerprint", "created_at"},
+	"admin_credentials":    {"key_id", "label", "role", "fingerprint", "enabled", "created_at", "updated_at", "last_used_at"},
+	"telemetry_retention":  {"tenant_id", "retention_days", "max_rows", "updated_at"},
+}
+
+// instanceID returns this installation's identifier, creating it on first use.
+// It is not secret: it exists to tell backups from different installations apart.
+func (s *Store) instanceID(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.instanceIDLocked(ctx)
+}
+
+func (s *Store) instanceIDLocked(ctx context.Context) (string, error) {
+	var existing string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM system_config WHERE key = 'instance_id'`).Scan(&existing)
+	if err == nil && existing != "" {
+		return existing, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	generated, err := randomHex(8)
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO system_config(key,value,updated_at) VALUES('instance_id',?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, generated, time.Now().UTC()); err != nil {
+		return "", err
+	}
+	return generated, nil
+}
+
+// RestoreReport describes what a restore replaced.
+type RestoreReport struct {
+	SourceInstance string `json:"source_instance"`
+	CrossInstance  bool   `json:"cross_instance"`
+	Rows           int    `json:"rows"`
+}
+
+func validateBackupPayload(payload backupPayload) error {
+	if payload.Version != 1 {
+		return fmt.Errorf("unsupported backup payload")
+	}
+	for table, columns := range backupTableColumns {
+		rows, ok := payload.Tables[table]
+		if !ok {
+			return fmt.Errorf("backup is missing the %s table", table)
+		}
+		for index, row := range rows {
+			for _, column := range columns {
+				if _, ok := row[column]; !ok {
+					return fmt.Errorf("backup row %d of %s is missing the %s column", index, table, column)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) ExportEncryptedBackup(ctx context.Context) (string, error) {
@@ -305,11 +395,19 @@ func (s *Store) ExportEncryptedBackup(ctx context.Context) (string, error) {
 		"telemetry_retention":  `SELECT tenant_id,retention_days,max_rows,updated_at FROM telemetry_retention`,
 	}
 	payload := backupPayload{Version: 1, Created: time.Now().UTC(), Tables: make(map[string][]backupRow, len(tables))}
+	instance, err := s.instanceID(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolving instance id: %w", err)
+	}
+	payload.InstanceID = instance
 	names := make([]string, 0, len(tables))
 	for name := range tables {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	for _, name := range names {
+		payload.Tables[name] = []backupRow{}
+	}
 	for _, name := range names {
 		rows, err := s.db.QueryContext(ctx, tables[name])
 		if err != nil {
@@ -345,23 +443,36 @@ func (s *Store) ExportEncryptedBackup(ctx context.Context) (string, error) {
 	return s.secrets.encrypt(string(encoded), backupAAD)
 }
 
-func (s *Store) RestoreEncryptedBackup(ctx context.Context, envelope string) error {
+func (s *Store) RestoreEncryptedBackup(ctx context.Context, envelope string) (RestoreReport, error) {
 	plaintext, err := s.secrets.decrypt(strings.TrimSpace(envelope), backupAAD)
 	if err != nil {
-		return fmt.Errorf("decrypting backup: %w", err)
+		return RestoreReport{}, fmt.Errorf("decrypting backup: %w", err)
 	}
 	var payload backupPayload
-	if err := json.Unmarshal([]byte(plaintext), &payload); err != nil || payload.Version != 1 {
-		return fmt.Errorf("unsupported backup payload")
+	if err := json.Unmarshal([]byte(plaintext), &payload); err != nil {
+		return RestoreReport{}, fmt.Errorf("unsupported backup payload")
 	}
+	if err := validateBackupPayload(payload); err != nil {
+		return RestoreReport{}, err
+	}
+
+	current, err := s.instanceID(ctx)
+	if err != nil {
+		return RestoreReport{}, fmt.Errorf("resolving instance id: %w", err)
+	}
+	report := RestoreReport{SourceInstance: payload.InstanceID, CrossInstance: payload.InstanceID != "" && payload.InstanceID != current}
+	for _, rows := range payload.Tables {
+		report.Rows += len(rows)
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return RestoreReport{}, err
 	}
 	defer tx.Rollback()
 	for _, table := range []string{"provider_credentials", "admin_credentials", "telemetry_retention", "tenants", "system_config"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
-			return err
+			return RestoreReport{}, err
 		}
 	}
 	insertRows := func(table string, columns []string) error {
@@ -378,22 +489,75 @@ func (s *Store) RestoreEncryptedBackup(ctx context.Context, envelope string) err
 		return nil
 	}
 	if err := insertRows("system_config", []string{"key", "value", "updated_at"}); err != nil {
-		return err
+		return RestoreReport{}, err
+	}
+	// The identifier belongs to the destination: a cross-instance restore must
+	// not rename this installation to the source one.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO system_config(key,value,updated_at) VALUES('instance_id',?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, current, time.Now().UTC()); err != nil {
+		return RestoreReport{}, err
 	}
 	if err := insertRows("tenants", []string{"id", "name", "proxy_key", "rate_limit", "entity_actions", "updated_at"}); err != nil {
-		return err
+		return RestoreReport{}, err
 	}
 	if err := insertRows("provider_credentials", []string{"id", "tenant_id", "provider", "label", "key_hint", "fingerprint", "created_at"}); err != nil {
-		return err
+		return RestoreReport{}, err
 	}
 	if err := insertRows("admin_credentials", []string{"key_id", "label", "role", "fingerprint", "enabled", "created_at", "updated_at", "last_used_at"}); err != nil {
-		return err
+		return RestoreReport{}, err
 	}
 	if err := insertRows("telemetry_retention", []string{"tenant_id", "retention_days", "max_rows", "updated_at"}); err != nil {
-		return err
+		return RestoreReport{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return RestoreReport{}, err
 	}
-	return s.migrateAndValidateSecrets(ctx)
+	if err := s.migrateAndValidateSecrets(ctx); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
+// AuditChainReport is the outcome of an integrity check over the audit trail.
+type AuditChainReport struct {
+	Valid    bool   `json:"valid"`
+	Events   int    `json:"events"`
+	BrokenAt string `json:"broken_at,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// VerifyAuditChain walks the trail in insertion order and reports the first
+// event whose signature does not match its content or whose predecessor link
+// does not point at the previous row. A deleted row breaks the chain.
+func (s *Store) VerifyAuditChain(ctx context.Context) (AuditChainReport, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,actor_key_id,actor_role,action,target_type,target_id,metadata,timestamp,nonce,signature,prev_hash FROM governance_audit ORDER BY seq ASC`)
+	if err != nil {
+		return AuditChainReport{}, fmt.Errorf("reading audit chain: %w", err)
+	}
+	defer rows.Close()
+
+	report := AuditChainReport{Valid: true}
+	expectedPrev := ""
+	for rows.Next() {
+		var item AuditEvent
+		var metadata string
+		if err := rows.Scan(&item.ID, &item.ActorKeyID, &item.ActorRole, &item.Action, &item.TargetType, &item.TargetID, &metadata, &item.Timestamp, &item.Nonce, &item.Signature, &item.PrevHash); err != nil {
+			return AuditChainReport{}, err
+		}
+		item.Metadata = json.RawMessage(metadata)
+		report.Events++
+		if item.PrevHash != expectedPrev {
+			report.Valid = false
+			report.BrokenAt = item.ID
+			report.Reason = "missing predecessor: a row was deleted or reordered"
+			return report, nil
+		}
+		if subtle.ConstantTimeCompare([]byte(s.auditSignature(item)), []byte(item.Signature)) != 1 {
+			report.Valid = false
+			report.BrokenAt = item.ID
+			report.Reason = "signature mismatch: a row was edited"
+			return report, nil
+		}
+		expectedPrev = item.Signature
+	}
+	return report, rows.Err()
 }

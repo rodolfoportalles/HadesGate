@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hadesgate/hadesgate/internal/anonymizer"
@@ -38,16 +41,31 @@ type Server struct {
 	webhook                   *webhook.Dispatcher
 	upstream                  *proxy.UpstreamDispatcher
 	securityPolicy            *SecurityPolicy
+	adminLimiter              atomic.Pointer[proxy.RateLimiter]
+	auditMu                   sync.Mutex
+	lastAuthFailure           time.Time
 }
 
 // NewServer creates a new web Server.
 func NewServer(engine *anonymizer.Engine, gateway *proxy.Gateway, adminKey string, staticFS fs.FS) *Server {
-	return &Server{
+	s := &Server{
 		engine:   engine,
 		gateway:  gateway,
 		adminKey: adminKey,
 		fs:       staticFS,
 	}
+	s.adminLimiter.Store(proxy.NewRateLimiter(defaultAdminRateLimit))
+	return s
+}
+
+// defaultAdminRateLimit bounds the administrative API per minute: enough for
+// the dashboard polling and for a person clicking, low enough that a runaway
+// extension loop cannot stack 2 MB anonymization scans.
+const defaultAdminRateLimit = 120
+
+// SetAdminRateLimit replaces the administrative limiter at boot.
+func (s *Server) SetAdminRateLimit(eventsPerMinute int) {
+	s.adminLimiter.Store(proxy.NewRateLimiter(eventsPerMinute))
 }
 
 // SetStore binds the dynamic configuration store to the server.
@@ -83,12 +101,31 @@ func (s *Server) SetSecurityPolicy(policy *SecurityPolicy) {
 
 func requestAPIKey(r *http.Request) string {
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-		return strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		return trimBearer(authHeader)
 	}
 	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
 		return key
 	}
 	return ""
+}
+
+// trimBearer strips a Bearer prefix case-insensitively.
+func trimBearer(header string) string {
+	header = strings.TrimSpace(header)
+	if len(header) >= 7 && strings.EqualFold(header[:7], "Bearer ") {
+		return strings.TrimSpace(header[7:])
+	}
+	return header
+}
+
+// clientIP prefers the first X-Forwarded-For hop for telemetry.
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
+			return first
+		}
+	}
+	return r.RemoteAddr
 }
 
 // RegisterRoutes registers dashboard and management API endpoints on the given multiplexer.
@@ -114,6 +151,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/admin-credentials/rotate", s.requireRole(config.RoleAdmin, s.handleAdminCredentialRotate))
 	mux.HandleFunc("/api/retention", s.requireRoleByMethod(config.RoleViewer, config.RoleOperator, s.handleRetention))
 	mux.HandleFunc("/api/audit/events", s.requireRole(config.RoleViewer, s.handleAuditEvents))
+	mux.HandleFunc("/api/audit/verify", s.requireRole(config.RoleViewer, s.handleAuditVerify))
 	mux.HandleFunc("/api/config-backup", s.requireRole(config.RoleAdmin, s.handleConfigBackup))
 
 	// Static frontend assets handler
@@ -336,7 +374,7 @@ func (s *Server) handleTestAnonymize(w http.ResponseWriter, r *http.Request) {
 				Action:          "block",
 				BlockedEntities: decision.Types,
 				Model:           model,
-				ClientIP:        r.RemoteAddr,
+				ClientIP:        clientIP(r),
 				Details:         "Extension prompt blocked by entity DLP policy",
 			})
 		}
@@ -526,6 +564,9 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	json.NewEncoder(w).Encode(resp)
+	if r.URL.Query().Get("export") == "1" {
+		s.auditChange(r, "traces.exported", "tenant", requestedTenant, map[string]interface{}{"page": page, "limit": limit, "total": total})
+	}
 }
 
 type AuthVerifyRequest struct {
@@ -569,12 +610,47 @@ func (s *Server) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
 	verifyRequest := r.Clone(r.Context())
 	verifyRequest.Header.Set("Authorization", "Bearer "+reqKey)
 	principal, isValid := s.authenticateAdmin(verifyRequest)
+	s.recordAuthAttempt(r, principal, isValid)
 	json.NewEncoder(w).Encode(AuthVerifyResponse{
 		Valid:   isValid,
 		DevMode: false,
 		KeyID:   principal.KeyID,
 		Role:    principal.Role,
 	})
+}
+
+// recordAuthAttempt writes an authentication event. Failures are debounced to
+// one every five seconds so an unauthenticated flood cannot fill the trail.
+func (s *Server) recordAuthAttempt(r *http.Request, principal adminPrincipal, ok bool) {
+	if s.store == nil {
+		return
+	}
+	action := "auth.success"
+	if !ok {
+		action = "auth.failure"
+		s.auditMu.Lock()
+		if !s.lastAuthFailure.IsZero() && time.Since(s.lastAuthFailure) < 5*time.Second {
+			s.auditMu.Unlock()
+			return
+		}
+		s.lastAuthFailure = time.Now()
+		s.auditMu.Unlock()
+	}
+	actor := principal.KeyID
+	if actor == "" {
+		actor = "anonymous"
+	}
+	metadata, _ := json.Marshal(map[string]interface{}{"valid": ok, "remote": r.RemoteAddr})
+	if err := s.store.RecordAuditEvent(r.Context(), config.AuditEvent{
+		ActorKeyID: actor,
+		ActorRole:  config.RoleViewer,
+		Action:     action,
+		TargetType: "credential",
+		TargetID:   principal.KeyID,
+		Metadata:   metadata,
+	}); err != nil {
+		log.Printf("⚠️  [AUDIT] could not record %s: %v", action, err)
+	}
 }
 
 func (s *Server) reloadGateway(ctx context.Context) error {
@@ -676,7 +752,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		cfg, err := s.store.GetDynamicConfig(r.Context())
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 		globalConfigured := cfg.GlobalProxyKey != ""
@@ -702,7 +778,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.store.SaveDynamicConfig(r.Context(), newCfg); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
@@ -815,7 +891,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		tenants, err := s.store.ListTenants(r.Context())
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 		if tenants == nil {
@@ -838,7 +914,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 		}
 		savedTenant, err := s.store.SaveTenant(r.Context(), tenant)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
@@ -866,7 +942,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 			origID = payload.ID
 		}
 		if err := s.store.UpdateTenant(r.Context(), origID, payload.TenantConfig); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
@@ -900,7 +976,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.store.DeleteTenant(r.Context(), id); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
