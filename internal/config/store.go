@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -426,6 +427,9 @@ func (s *Store) ListTenants(ctx context.Context) ([]TenantConfig, error) {
 	return tenants, rows.Err()
 }
 
+// tenantIDPattern keeps IDs usable in the /t/{id}/ route.
+var tenantIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
 // SaveTenant creates or updates a tenant record. If tenant.ID is empty, it auto-assigns the next sequential ID.
 func (s *Store) SaveTenant(ctx context.Context, tenant TenantConfig) (TenantConfig, error) {
 	s.mu.Lock()
@@ -445,6 +449,9 @@ func (s *Store) UpdateTenant(ctx context.Context, originalID string, tenant Tena
 
 	if tenant.ID == "" {
 		return fmt.Errorf("tenant ID is required")
+	}
+	if !tenantIDPattern.MatchString(tenant.ID) {
+		return fmt.Errorf("tenant ID %q must match [A-Za-z0-9_-] up to 64 characters", tenant.ID)
 	}
 
 	now := time.Now().UTC()
@@ -518,6 +525,9 @@ func (s *Store) saveTenantLocked(ctx context.Context, tenant TenantConfig) (Tena
 	tenant.ID = strings.TrimSpace(tenant.ID)
 	tenant.Name = strings.TrimSpace(tenant.Name)
 	tenant.ProxyKey = strings.TrimSpace(tenant.ProxyKey)
+	if tenant.ID != "" && !tenantIDPattern.MatchString(tenant.ID) {
+		return tenant, fmt.Errorf("tenant ID %q must match [A-Za-z0-9_-] up to 64 characters", tenant.ID)
+	}
 
 	// Auto-assign sequential numeric ID if empty
 	if tenant.ID == "" {

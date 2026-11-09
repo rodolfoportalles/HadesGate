@@ -82,3 +82,33 @@ func TestLoadNetworkSecurityDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("expected two private upstream allowlist entries, got %v", cfg.PrivateUpstreamAllowedHosts)
 	}
 }
+
+func TestLoad_GeneratedKeysAreFlagged(t *testing.T) {
+	t.Setenv("HADESGATE_ADMIN_KEY", "")
+	t.Setenv("HADESGATE_PROXY_KEY", "")
+	t.Setenv("HADESGATE_CONFIG_MASTER_KEY", "")
+
+	cfg := Load()
+	if !cfg.GeneratedAdminKey || !cfg.GeneratedProxyKey {
+		t.Fatalf("expected both keys to be flagged as generated: %+v", cfg)
+	}
+	if len(cfg.AdminKey) <= len("hadesgate_sec_") || len(cfg.ProxyKey) <= len("hadesgate_proxy_") {
+		t.Fatalf("generated keys look truncated: admin=%q proxy=%q", cfg.AdminKey, cfg.ProxyKey)
+	}
+	if cfg.AdminKey == ExampleAdminKey {
+		t.Fatal("a generated admin key must not reuse the public example value")
+	}
+}
+
+func TestLoad_PublicExampleKeyIsNotFlagged(t *testing.T) {
+	t.Setenv("HADESGATE_ADMIN_KEY", ExampleAdminKey)
+	t.Setenv("HADESGATE_PROXY_KEY", "distinct_proxy_key")
+
+	cfg := Load()
+	if cfg.GeneratedAdminKey {
+		t.Fatal("an explicit admin key must not be flagged as generated")
+	}
+	if cfg.GeneratedProxyKey {
+		t.Fatal("an explicit proxy key must not be flagged as generated")
+	}
+}

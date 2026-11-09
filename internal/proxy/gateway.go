@@ -359,7 +359,7 @@ func (g *Gateway) authenticateTenant(r *http.Request) (string, bool) {
 func requestHeaderCredentials(r *http.Request) []string {
 	values := make([]string, 0, 3)
 	if authHeader := strings.TrimSpace(r.Header.Get("Authorization")); authHeader != "" {
-		values = append(values, strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer ")))
+		values = append(values, trimBearer(authHeader))
 	}
 	for _, header := range []string{"X-API-Key", "X-Goog-Api-Key"} {
 		if key := strings.TrimSpace(r.Header.Get(header)); key != "" {
@@ -367,6 +367,16 @@ func requestHeaderCredentials(r *http.Request) []string {
 		}
 	}
 	return values
+}
+
+// trimBearer strips a Bearer prefix case-insensitively: SDKs and proxies are
+// inconsistent about the casing of the scheme.
+func trimBearer(header string) string {
+	header = strings.TrimSpace(header)
+	if len(header) >= 7 && strings.EqualFold(header[:7], "Bearer ") {
+		return strings.TrimSpace(header[7:])
+	}
+	return header
 }
 
 func requestProviderCredentials(r *http.Request) []string {
@@ -1072,4 +1082,16 @@ Diretrizes para o Modelo Local:
 		strings.Join(famList, ", "),
 		strings.Join(details, "\n"),
 	)
+}
+
+// clientIP prefers the first X-Forwarded-For hop, which is the real client
+// behind a reverse proxy. The header is client-controlled when the gateway is
+// exposed directly, so it is telemetry only.
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
+			return first
+		}
+	}
+	return r.RemoteAddr
 }

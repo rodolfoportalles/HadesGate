@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -78,9 +79,9 @@ func (d *SemanticDetector) Detect(text string) []Match {
 
 	matches := make([]Match, 0, len(envelope.Entities))
 	for _, entity := range envelope.Entities {
-		entityType := entity.EntityType
-		if entityType == "" {
-			entityType = entity.Type
+		entityType := sanitizeTokenLabel(entity.EntityType)
+		if entityType == "SEMANTIC" {
+			entityType = sanitizeTokenLabel(entity.Type)
 		}
 		value := entity.Value
 		if value == "" {
@@ -105,4 +106,22 @@ func (d *SemanticDetector) recordFailure() {
 		d.openUntilUnixNano.Store(time.Now().Add(30 * time.Second).UnixNano())
 		d.consecutiveFailures.Store(0)
 	}
+}
+
+// sanitizeTokenLabel keeps the sidecar-supplied type usable as a token label
+// ([HG_<ns>_<TYPE>_<n>]): upper case, A-Z 0-9 and underscore only, 32 chars.
+func sanitizeTokenLabel(raw string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(strings.TrimSpace(raw)) {
+		if b.Len() >= 32 {
+			break
+		}
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "SEMANTIC"
+	}
+	return b.String()
 }

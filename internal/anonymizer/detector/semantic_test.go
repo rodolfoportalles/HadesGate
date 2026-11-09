@@ -44,3 +44,20 @@ func TestSemanticDetectorCircuitBreaker(t *testing.T) {
 		t.Fatalf("circuit breaker did not open after three failures, calls=%d", calls.Load())
 	}
 }
+
+func TestSanitizeTokenLabel(t *testing.T) {
+	cases := map[string]string{
+		"CPF":         "CPF",
+		"person name": "PERSONNAME",
+		"cpf]":        "CPF",
+		"a.b-c":       "ABC",
+		"":            "SEMANTIC",
+		"--":          "SEMANTIC",
+		"aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd": "AAAAAAAAAABBBBBBBBBBCCCCCCCCCCDD",
+	}
+	for input, want := range cases {
+		if got := sanitizeTokenLabel(input); got != want {
+			t.Fatalf("sanitizeTokenLabel(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
