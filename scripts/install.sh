@@ -183,10 +183,28 @@ main() {
   # Prepare local configuration directory
   CONFIG_DIR="$HOME/.hadesgate"
   mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/data"
+  umask 077
   if [ ! -f "$CONFIG_DIR/.env" ] && [ -f "$TMP_DIR/.env.example" ]; then
     cp "$TMP_DIR/.env.example" "$CONFIG_DIR/.env"
-    info "Criado arquivo de ambiente padrão em: $CONFIG_DIR/.env"
+    # Replace the public example material with real random values.
+    if command -v openssl >/dev/null 2>&1; then
+      ADMIN_KEY="hadesgate_sec_$(openssl rand -hex 32)"
+      MASTER_KEY="$(openssl rand -base64 32)"
+      FINGERPRINT_SECRET="$(openssl rand -hex 32)"
+      sed -i.bak \
+        -e "s|^HADESGATE_ADMIN_KEY=.*|HADESGATE_ADMIN_KEY=$ADMIN_KEY|" \
+        -e "s|^HADESGATE_CONFIG_MASTER_KEY=.*|HADESGATE_CONFIG_MASTER_KEY=$MASTER_KEY|" \
+        -e "s|^HADESGATE_FINGERPRINT_SECRET=.*|HADESGATE_FINGERPRINT_SECRET=$FINGERPRINT_SECRET|" \
+        "$CONFIG_DIR/.env" && rm -f "$CONFIG_DIR/.env.bak"
+      chmod 600 "$CONFIG_DIR/.env"
+      info "Chaves administrativa e mestra geradas em: $CONFIG_DIR/.env"
+      warn "Guarde HADESGATE_CONFIG_MASTER_KEY fora da máquina: sem ela o banco não abre."
+    else
+      chmod 600 "$CONFIG_DIR/.env"
+      warn "'openssl' não encontrado: o .env mantém a chave administrativa pública. Troque antes de expor o gateway."
+    fi
   fi
+  umask 022
 
   # Path warning if installed to ~/.local/bin and not on PATH
   case ":$PATH:" in

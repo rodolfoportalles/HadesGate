@@ -12,12 +12,18 @@ import (
 	"time"
 )
 
+// ExampleAdminKey is the placeholder shipped in .env.example. Booting with it
+// unchanged means the dashboard key is public knowledge.
+const ExampleAdminKey = "hadesgate_sec_admin_key_2026"
+
 // Config encapsulates runtime configuration for the HadesGate gateway.
 type Config struct {
 	BindAddress                 string
 	Port                        int
 	AdminKey                    string
 	ProxyKey                    string
+	GeneratedAdminKey           bool
+	GeneratedProxyKey           bool
 	ProviderFingerprintSecret   string
 	ConfigMasterKey             string
 	AllowLegacyURLKeys          bool
@@ -437,27 +443,32 @@ func Load() *Config {
 	}
 
 	// Security requirement: Ensure AdminKey is never empty.
-	// If not provided in .env or flags, generate an inaccessible session key. The
-	// value is deliberately not logged; production deployments must configure it.
+	// A generated key is printed once at boot (see cmd/hadesgate) so a deployment
+	// without configuration stays reachable instead of becoming a locked box.
 	if cfg.AdminKey == "" {
 		bytes := make([]byte, 32)
 		if _, err := rand.Read(bytes); err == nil {
 			cfg.AdminKey = fmt.Sprintf("hadesgate_sec_%x", bytes)
-			log.Printf("⚠️  [SECURITY NOTICE] No HADESGATE_ADMIN_KEY configured. Generated an ephemeral key without logging it; configure the variable to use the dashboard.\n")
+			cfg.GeneratedAdminKey = true
 		}
 	}
 	if cfg.ProxyKey == "" {
 		bytes := make([]byte, 32)
 		if _, err := rand.Read(bytes); err == nil {
 			cfg.ProxyKey = fmt.Sprintf("hadesgate_proxy_%x", bytes)
+			cfg.GeneratedProxyKey = true
 		}
 	}
 	if cfg.ProxyKey != "" && subtle.ConstantTimeCompare([]byte(cfg.ProxyKey), []byte(cfg.AdminKey)) == 1 {
 		bytes := make([]byte, 32)
 		if _, err := rand.Read(bytes); err == nil {
 			cfg.ProxyKey = fmt.Sprintf("hadesgate_proxy_%x", bytes)
+			cfg.GeneratedProxyKey = true
 			log.Printf("⚠️  [SECURITY NOTICE] HADESGATE_PROXY_KEY matched HADESGATE_ADMIN_KEY and was replaced with an ephemeral, non-admin proxy key.\n")
 		}
+	}
+	if cfg.AdminKey == ExampleAdminKey {
+		log.Printf("⚠️  [SECURITY NOTICE] HADESGATE_ADMIN_KEY still uses the public value from .env.example. Replace it before exposing the gateway.\n")
 	}
 	if cfg.BindAddress = strings.TrimSpace(cfg.BindAddress); cfg.BindAddress == "" {
 		cfg.BindAddress = "127.0.0.1"

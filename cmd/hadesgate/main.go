@@ -24,6 +24,14 @@ import (
 
 func main() {
 	cfg := config.Load()
+	// A key coming from env or flags is an explicit operator decision and must
+	// win over whatever an earlier boot persisted. Only a generated key defers
+	// to the stored one, which keeps restarts stable.
+	envProxyKey := !cfg.GeneratedProxyKey
+	generatedProxyKey := ""
+	if cfg.GeneratedProxyKey {
+		generatedProxyKey = cfg.ProxyKey
+	}
 	configMasterKey, keyErr := config.ParseMasterKey(cfg.ConfigMasterKey)
 	if keyErr != nil {
 		log.Fatalf("configuration encryption unavailable: %v", keyErr)
@@ -120,7 +128,21 @@ func main() {
 				cfg.EntityActions = dynCfg.EntityActions
 			}
 			if dynCfg.GlobalProxyKey != "" {
-				cfg.ProxyKey = dynCfg.GlobalProxyKey
+				switch {
+				case envProxyKey && dynCfg.GlobalProxyKey != cfg.ProxyKey:
+					log.Printf("🔑 HADESGATE_PROXY_KEY overrides the persisted global proxy key")
+					dynCfg.GlobalProxyKey = cfg.ProxyKey
+					if err := configStore.SaveDynamicConfig(context.Background(), dynCfg); err != nil {
+						log.Printf("⚠️  could not persist the configured proxy key: %v", err)
+					}
+				case !envProxyKey:
+					cfg.ProxyKey = dynCfg.GlobalProxyKey
+				}
+			} else if envProxyKey {
+				dynCfg.GlobalProxyKey = cfg.ProxyKey
+				if err := configStore.SaveDynamicConfig(context.Background(), dynCfg); err != nil {
+					log.Printf("⚠️  could not persist the configured proxy key: %v", err)
+				}
 			}
 			if dynCfg.WebhookURL != "" {
 				cfg.WebhookURL = dynCfg.WebhookURL
@@ -165,6 +187,15 @@ func main() {
 		}
 	}
 
+	// A generated key is printed once so a deployment without configuration can
+	// still be reached. Persisted keys win at the next boot, so this is stable.
+	if cfg.GeneratedAdminKey {
+		log.Printf("🔑 Generated HADESGATE_ADMIN_KEY for this boot: %s", cfg.AdminKey)
+	}
+	if generatedProxyKey != "" && cfg.ProxyKey == generatedProxyKey {
+		log.Printf("🔑 Generated HADESGATE_PROXY_KEY for this boot: %s", cfg.ProxyKey)
+	}
+
 	// 5. Initialize Webhook Alert Dispatcher
 	webhookEvents := make(map[string]bool)
 	for _, e := range cfg.WebhookEvents {
@@ -200,6 +231,9 @@ func main() {
 		Engine:                      engine,
 		Webhook:                     webhookDisp,
 	})
+	// Webhooks leave the process too: reuse the proxy address policy so
+	// private hosts stay reachable while metadata and redirects are refused.
+	webhookDisp.SetTransport(upstream.EgressTransport())
 
 	// 7. Initialize Gateway Proxy Handler
 	gateway := proxy.NewGatewayWithOptions(engine, upstream, traceLogger, proxy.GatewayOptions{
