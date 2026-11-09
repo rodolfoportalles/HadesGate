@@ -75,9 +75,15 @@ func (s *Server) requireRoleByMethod(readRole, writeRole config.AdminRole, next 
 }
 
 func writeAuthorizationError(w http.ResponseWriter, status int, message string) {
+	writeJSONError(w, status, "auth_error", message)
+}
+
+// writeJSONError encodes the message with encoding/json instead of %q, whose
+// \x escapes are not valid JSON.
+func writeJSONError(w http.ResponseWriter, status int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": map[string]string{"message": message, "type": "auth_error"}})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": map[string]string{"message": message, "type": errType}})
 }
 
 func (s *Server) isAdminRequest(r *http.Request) bool {

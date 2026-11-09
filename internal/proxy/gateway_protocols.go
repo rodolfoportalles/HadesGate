@@ -105,7 +105,7 @@ func (g *Gateway) HandleResponses(w http.ResponseWriter, r *http.Request) {
 				ID: requestID, Tenant: tenant, TenantName: tenantName,
 				UserLabel: userInfo.Label, UserRole: userInfo.Role,
 				PolicyAction: w.Header().Get("X-HadesGate-Policy-Action"),
-				Timestamp: start, Provider: observability.InferProvider("responses", model, targetURL, isMock),
+				Timestamp:    start, Provider: observability.InferProvider("responses", model, targetURL, isMock),
 				Model: model, Language: detectedLang, Stream: isStreaming,
 				StatusCode: statusCode, DurationMs: float64(time.Since(start).Microseconds()) / 1000,
 				AnonDurationUs: anonDurationUs, EntitiesCount: entities,
@@ -248,7 +248,7 @@ func (g *Gateway) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request
 				ID: requestID, Tenant: tenant, TenantName: tenantName,
 				UserLabel: userInfo.Label, UserRole: userInfo.Role,
 				PolicyAction: w.Header().Get("X-HadesGate-Policy-Action"),
-				Timestamp: start, Provider: observability.InferProvider("anthropic", model, targetURL, false),
+				Timestamp:    start, Provider: observability.InferProvider("anthropic", model, targetURL, false),
 				Model: model, Language: detectedLang, Stream: isStreaming,
 				StatusCode: statusCode, DurationMs: float64(time.Since(start).Microseconds()) / 1000,
 				AnonDurationUs: anonDurationUs, EntitiesCount: entities,
@@ -286,7 +286,12 @@ func (g *Gateway) HandleAnthropicMessages(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var apiKey string
-	_, providerKey, _ := g.providerCredentialForRequest(r)
+	// X-Upstream-Key wins over a registered BYOK credential, matching the
+	// OpenAI-compatible path.
+	providerKey := trimBearer(r.Header.Get("X-Upstream-Key"))
+	if providerKey == "" {
+		_, providerKey, _ = g.providerCredentialForRequest(r)
+	}
 	targetURL, apiKey, err = g.upstream.ResolveAnthropicTargetForKey(providerKey)
 	if err != nil {
 		statusCode = http.StatusServiceUnavailable
@@ -402,7 +407,7 @@ func (g *Gateway) HandleGeminiModels(w http.ResponseWriter, r *http.Request) {
 				ID: requestID, Tenant: tenant, TenantName: tenantName,
 				UserLabel: userInfo.Label, UserRole: userInfo.Role,
 				PolicyAction: w.Header().Get("X-HadesGate-Policy-Action"),
-				Timestamp: start, Provider: observability.InferProvider("gemini", model, targetURL, false),
+				Timestamp:    start, Provider: observability.InferProvider("gemini", model, targetURL, false),
 				Model: model, Language: detectedLang, Stream: isStreaming,
 				StatusCode: statusCode, DurationMs: float64(time.Since(start).Microseconds()) / 1000,
 				AnonDurationUs: anonDurationUs, EntitiesCount: entities,

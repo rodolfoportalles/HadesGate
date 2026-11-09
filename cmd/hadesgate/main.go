@@ -267,11 +267,12 @@ func main() {
 	handler := securityPolicy.Handler(mux)
 
 	server := &http.Server{
-		Addr:         net.JoinHostPort(cfg.BindAddress, strconv.Itoa(cfg.Port)),
-		Handler:      handler,
-		ReadTimeout:  120 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              net.JoinHostPort(cfg.BindAddress, strconv.Itoa(cfg.Port)),
+		Handler:           handler,
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown listener

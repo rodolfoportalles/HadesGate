@@ -2,7 +2,6 @@ package web
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -109,7 +108,7 @@ func (s *Server) handleAdminCredentialRotate(w http.ResponseWriter, r *http.Requ
 
 	credential, err := s.store.RotateAdminCredential(r.Context(), keyID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "server_error", err.Error())
 		return
 	}
 

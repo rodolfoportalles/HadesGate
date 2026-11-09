@@ -101,7 +101,7 @@ func isMatchingAdminKey(authHeader, adminKey string) bool {
 	if adminKey == "" {
 		return false
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	token := trimBearer(authHeader)
 	return subtle.ConstantTimeCompare([]byte(token), []byte(adminKey)) == 1
 }
 
@@ -297,7 +297,7 @@ func (u *UpstreamDispatcher) ResolveAnthropicTargetForKey(providerKey string) (s
 func (u *UpstreamDispatcher) ResolveGeminiTarget(r *http.Request, model, action string, isSSE bool) (string, string, error) {
 	key := strings.TrimSpace(r.Header.Get("X-Upstream-Key"))
 	if key != "" {
-		key = strings.TrimSpace(strings.TrimPrefix(key, "Bearer "))
+		key = trimBearer(key)
 	} else if u.cfg.GeminiKey != "" {
 		key = u.cfg.GeminiKey
 	} else if u.cfg.AdminKey == "" {
