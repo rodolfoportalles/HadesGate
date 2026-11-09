@@ -54,6 +54,11 @@ func (s *Server) requireRole(required config.AdminRole, next http.HandlerFunc) h
 			writeAuthorizationError(w, http.StatusForbidden, "Insufficient administrative role")
 			return
 		}
+		if limiter := s.adminLimiter.Load(); limiter != nil && !limiter.Allow() {
+			w.Header().Set("Retry-After", "30")
+			writeAuthorizationError(w, http.StatusTooManyRequests, "Administrative rate limit reached")
+			return
+		}
 		ctx := context.WithValue(r.Context(), principalContextKey{}, principal)
 		next(w, r.WithContext(ctx))
 	}

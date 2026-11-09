@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -132,11 +133,17 @@ func (u *UpstreamDispatcher) dialContext(ctx context.Context, network, address s
 	if err != nil {
 		return nil, fmt.Errorf("parsing upstream address: %w", err)
 	}
+	return u.dialValidated(ctx, network, host, port, u.isPrivateUpstreamAllowed(host, port))
+}
+
+// dialValidated resolves the host, validates every returned address and dials
+// the first one, so the socket cannot be redirected after validation.
+func (u *UpstreamDispatcher) dialValidated(ctx context.Context, network, host, port string, allowPrivate bool) (net.Conn, error) {
 	addresses, err := u.resolveHost(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("resolving upstream address: %w", err)
 	}
-	if err := validateResolvedAddresses(addresses, u.isPrivateUpstreamAllowed(host, port)); err != nil {
+	if err := validateResolvedAddresses(addresses, allowPrivate); err != nil {
 		return nil, err
 	}
 
@@ -147,4 +154,32 @@ func (u *UpstreamDispatcher) dialContext(ctx context.Context, network, address s
 	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	return dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+}
+
+// EgressTransport returns an outbound transport that applies the proxy address
+// policy to arbitrary destinations: DNS validation, IP pinning against
+// rebinding and permanent blocking of link-local, metadata and reserved ranges.
+// Private (loopback/RFC1918) destinations stay allowed because intranet
+// webhooks are a normal target; metadata stays blocked on purpose.
+func (u *UpstreamDispatcher) EgressTransport() *http.Transport {
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, fmt.Errorf("parsing egress address: %w", err)
+			}
+			return u.dialValidated(ctx, network, host, port, true)
+		},
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+}
+
+// RejectRedirects is the redirect policy used by the proxy and by webhooks:
+// the redirect target is not re-validated, so it is refused.
+func RejectRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }

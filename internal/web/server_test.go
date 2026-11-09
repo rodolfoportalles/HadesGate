@@ -1201,3 +1201,110 @@ func TestServer_TelemetryEnrichment_TenantAndUser(t *testing.T) {
 		t.Errorf("unexpected tenant trace: %+v", finTrace)
 	}
 }
+
+func TestServer_AdminRateLimitAppliesAfterAuth(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	srv, mux := setupTestServer(adminKey)
+	srv.SetAdminRateLimit(2)
+
+	call := func(key string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/vault", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if c := call(adminKey); c != http.StatusOK {
+		t.Fatalf("first call: %d", c)
+	}
+	if c := call(adminKey); c != http.StatusOK {
+		t.Fatalf("second call: %d", c)
+	}
+	if c := call(adminKey); c != http.StatusTooManyRequests {
+		t.Fatalf("third call should be limited, got %d", c)
+	}
+	// An unauthenticated call must not consume the authenticated budget.
+	if c := call(""); c != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated call must still be 401, got %d", c)
+	}
+}
+
+func TestServer_AuthAttemptsAreAudited(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	srv, mux := setupTestServer(adminKey)
+
+	verify := func(key string) {
+		body := `{"key":"` + key + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/verify", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+	}
+
+	verify(adminKey)
+	verify("wrong-key")
+
+	events, err := srv.store.ListAuditEvents(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("listing audit events: %v", err)
+	}
+	var success, failure bool
+	for _, event := range events {
+		switch event.Action {
+		case "auth.success":
+			success = true
+			if event.ActorKeyID != "bootstrap" {
+				t.Fatalf("success must record the key id, got %q", event.ActorKeyID)
+			}
+		case "auth.failure":
+			failure = true
+		}
+	}
+	if !success || !failure {
+		t.Fatalf("expected a success and a failure event, got %+v", events)
+	}
+
+	// The failure is debounced, so a second rapid failure must not add a row.
+	before := len(events)
+	verify("wrong-key-again")
+	after, _ := srv.store.ListAuditEvents(context.Background(), 10)
+	if len(after) != before {
+		t.Fatalf("rapid failures must be debounced: before=%d after=%d", before, len(after))
+	}
+}
+
+func TestServer_ConfigRestoreRequiresConfirmation(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	srv, mux := setupTestServer(adminKey)
+	exported := httptest.NewRequest(http.MethodGet, "/api/config-backup", nil)
+	exported.Header.Set("Authorization", "Bearer "+adminKey)
+	exportedRec := httptest.NewRecorder()
+	mux.ServeHTTP(exportedRec, exported)
+	var envelope struct {
+		Backup string `json:"backup"`
+	}
+	if err := json.NewDecoder(exportedRec.Body).Decode(&envelope); err != nil || envelope.Backup == "" {
+		t.Fatalf("export failed: %s", exportedRec.Body.String())
+	}
+
+	post := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/config-backup", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+adminKey)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{"backup": envelope.Backup})
+	if code := post(string(payload)); code != http.StatusPreconditionRequired {
+		t.Fatalf("restore without confirm must be refused with 428, got %d", code)
+	}
+	payload, _ = json.Marshal(map[string]interface{}{"backup": envelope.Backup, "confirm": true})
+	if code := post(string(payload)); code != http.StatusOK {
+		t.Fatalf("confirmed restore failed with %d", code)
+	}
+	_ = srv
+}
