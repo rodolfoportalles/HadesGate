@@ -1201,3 +1201,89 @@ func TestServer_TelemetryEnrichment_TenantAndUser(t *testing.T) {
 		t.Errorf("unexpected tenant trace: %+v", finTrace)
 	}
 }
+
+func TestServer_ClearingGlobalProxyKeyRevokesItImmediately(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	const bootKey = "sec_HG_boot_proxy_key"
+	const oldKey = "sec_HG_rotated_proxy_key"
+	srv, mux := setupTestServer(adminKey)
+	srv.SetBootProxyKey(bootKey)
+	srv.gateway.UpdateDynamicConfig(nil, nil, nil, nil, 0, oldKey)
+
+	if err := srv.store.SaveDynamicConfig(context.Background(), config.DynamicConfig{GlobalProxyKey: oldKey}); err != nil {
+		t.Fatalf("saving dynamic config: %v", err)
+	}
+
+	put := func(payload string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+adminKey)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+
+	// A new key rotates immediately.
+	if w := put(`{"entity_actions":{},"global_proxy_key":"sec_HG_new_proxy_key"}`); w.Code != http.StatusOK {
+		t.Fatalf("rotating the key returned %d: %s", w.Code, w.Body.String())
+	}
+	if _, ok := srv.gateway.AuthenticateKey("sec_HG_new_proxy_key"); !ok {
+		t.Fatal("rotated key is not accepted")
+	}
+	if _, ok := srv.gateway.AuthenticateKey(oldKey); ok {
+		t.Fatal("previous key is still accepted after rotation")
+	}
+
+	// Clearing revokes the current key and falls back to the boot key.
+	if w := put(`{"entity_actions":{},"global_proxy_key":"__CLEAR__"}`); w.Code != http.StatusOK {
+		t.Fatalf("clearing the key returned %d: %s", w.Code, w.Body.String())
+	}
+	if _, ok := srv.gateway.AuthenticateKey("sec_HG_new_proxy_key"); ok {
+		t.Fatal("cleared key is still accepted until restart")
+	}
+	if _, ok := srv.gateway.AuthenticateKey(bootKey); !ok {
+		t.Fatal("boot key is not accepted after clearing the stored key")
+	}
+}
+
+func TestServer_AdminRateLimitAppliesAfterAuth(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	srv, mux := setupTestServer(adminKey)
+	srv.SetAdminRateLimit(2)
+
+	call := func(key string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/vault", nil)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	if c := call(adminKey); c != http.StatusOK {
+		t.Fatalf("first call: %d", c)
+	}
+	if c := call(adminKey); c != http.StatusOK {
+		t.Fatalf("second call: %d", c)
+	}
+	if c := call(adminKey); c != http.StatusTooManyRequests {
+		t.Fatalf("third call should be limited, got %d", c)
+	}
+	// An unauthenticated call must not consume the authenticated budget.
+	if c := call(""); c != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated call must still be 401, got %d", c)
+	}
+}
+
+func TestServer_AcceptsLowercaseBearerScheme(t *testing.T) {
+	const adminKey = "admin-secret-key"
+	_, mux := setupTestServer(adminKey)
+	req := httptest.NewRequest(http.MethodGet, "/api/vault", nil)
+	req.Header.Set("Authorization", "bearer "+adminKey)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("lowercase bearer must authenticate, got %d: %s", w.Code, w.Body.String())
+	}
+}

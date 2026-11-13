@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,12 +45,41 @@ type Config struct {
 type Dispatcher struct {
 	mu         sync.RWMutex
 	cfg        Config
-	client     *http.Client
+	client     atomic.Pointer[http.Client]
+	transport  atomic.Pointer[http.RoundTripper]
 	eventQueue chan Event
 	wg         sync.WaitGroup
 	stopChan   chan struct{}
 	stopOnce   sync.Once
 	workerOnce sync.Once
+}
+
+func newHTTPClient(timeout time.Duration, transport http.RoundTripper) *http.Client {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	client := &http.Client{Timeout: timeout}
+	if transport != nil {
+		client.Transport = transport
+		// A redirect target is not re-validated, so it must not be followed.
+		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	return client
+}
+
+// SetTransport installs the outbound transport, typically the SSRF-validated
+// one exported by the proxy, and rebuilds the client.
+func (d *Dispatcher) SetTransport(transport http.RoundTripper) {
+	if d == nil || transport == nil {
+		return
+	}
+	d.transport.Store(&transport)
+	d.mu.RLock()
+	timeout := d.cfg.Timeout
+	d.mu.RUnlock()
+	d.client.Store(newHTTPClient(timeout, transport))
 }
 
 // NewDispatcher creates and starts an asynchronous webhook worker.
@@ -59,13 +89,11 @@ func NewDispatcher(cfg Config) *Dispatcher {
 	}
 	cfg.Events = cloneEvents(cfg.Events)
 	d := &Dispatcher{
-		cfg: cfg,
-		client: &http.Client{
-			Timeout: cfg.Timeout,
-		},
+		cfg:        cfg,
 		eventQueue: make(chan Event, 1024),
 		stopChan:   make(chan struct{}),
 	}
+	d.client.Store(newHTTPClient(cfg.Timeout, nil))
 
 	if cfg.URL != "" {
 		d.startWorker()
@@ -94,7 +122,13 @@ func (d *Dispatcher) UpdateConfig(cfg Config) {
 	}
 	cfg.Events = cloneEvents(cfg.Events)
 	d.cfg = cfg
-	d.client.Timeout = cfg.Timeout
+	// Publish a fresh client instead of mutating Timeout on the shared one:
+	// net/http reads it on every Do while deliveries are in flight.
+	var transport http.RoundTripper
+	if holder := d.transport.Load(); holder != nil {
+		transport = *holder
+	}
+	d.client.Store(newHTTPClient(cfg.Timeout, transport))
 
 	if cfg.URL != "" {
 		d.startWorker()
@@ -180,7 +214,7 @@ func (d *Dispatcher) TestDispatchTarget(targetURL, secret string, evt Event) err
 		req.Header.Set("X-HadesGate-Signature", "sha256="+sig)
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := d.client.Load().Do(req)
 	if err != nil {
 		return fmt.Errorf("connecting to %s: %w", targetURL, err)
 	}
@@ -292,7 +326,7 @@ func (d *Dispatcher) send(evt Event) {
 		req.Header.Set("X-HadesGate-Signature", "sha256="+sig)
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := d.client.Load().Do(req)
 	if err != nil {
 		log.Printf("⚠️  [WEBHOOK] Failed to deliver webhook to %s: %v\n", url, err)
 		return

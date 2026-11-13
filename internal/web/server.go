@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hadesgate/hadesgate/internal/anonymizer"
@@ -31,6 +32,7 @@ type Server struct {
 	engine                    *anonymizer.Engine
 	gateway                   *proxy.Gateway
 	adminKey                  string
+	bootProxyKey              string
 	providerFingerprintSecret string
 	defaultRateLimit          int
 	fs                        fs.FS
@@ -38,16 +40,29 @@ type Server struct {
 	webhook                   *webhook.Dispatcher
 	upstream                  *proxy.UpstreamDispatcher
 	securityPolicy            *SecurityPolicy
+	adminLimiter              atomic.Pointer[proxy.RateLimiter]
 }
 
 // NewServer creates a new web Server.
 func NewServer(engine *anonymizer.Engine, gateway *proxy.Gateway, adminKey string, staticFS fs.FS) *Server {
-	return &Server{
+	s := &Server{
 		engine:   engine,
 		gateway:  gateway,
 		adminKey: adminKey,
 		fs:       staticFS,
 	}
+	s.adminLimiter.Store(proxy.NewRateLimiter(defaultAdminRateLimit))
+	return s
+}
+
+// defaultAdminRateLimit bounds the administrative API per minute: enough for
+// the dashboard polling and for a person clicking, low enough that a runaway
+// extension loop cannot stack 2 MB anonymization scans.
+const defaultAdminRateLimit = 120
+
+// SetAdminRateLimit replaces the administrative limiter at boot.
+func (s *Server) SetAdminRateLimit(eventsPerMinute int) {
+	s.adminLimiter.Store(proxy.NewRateLimiter(eventsPerMinute))
 }
 
 // SetStore binds the dynamic configuration store to the server.
@@ -76,6 +91,12 @@ func (s *Server) SetDefaultRateLimit(limit int) {
 	s.defaultRateLimit = limit
 }
 
+// SetBootProxyKey preserves the boot/env proxy key so clearing the stored key
+// reverts to it instead of leaving the gateway with no usable key.
+func (s *Server) SetBootProxyKey(key string) {
+	s.bootProxyKey = strings.TrimSpace(key)
+}
+
 // SetSecurityPolicy enables atomic hot reload of CORS origins and HTTP security policy.
 func (s *Server) SetSecurityPolicy(policy *SecurityPolicy) {
 	s.securityPolicy = policy
@@ -83,12 +104,31 @@ func (s *Server) SetSecurityPolicy(policy *SecurityPolicy) {
 
 func requestAPIKey(r *http.Request) string {
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-		return strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		return trimBearer(authHeader)
 	}
 	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
 		return key
 	}
 	return ""
+}
+
+// trimBearer strips a Bearer prefix case-insensitively.
+func trimBearer(header string) string {
+	header = strings.TrimSpace(header)
+	if len(header) >= 7 && strings.EqualFold(header[:7], "Bearer ") {
+		return strings.TrimSpace(header[7:])
+	}
+	return header
+}
+
+// clientIP prefers the first X-Forwarded-For hop for telemetry.
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
+			return first
+		}
+	}
+	return r.RemoteAddr
 }
 
 // RegisterRoutes registers dashboard and management API endpoints on the given multiplexer.
@@ -336,7 +376,7 @@ func (s *Server) handleTestAnonymize(w http.ResponseWriter, r *http.Request) {
 				Action:          "block",
 				BlockedEntities: decision.Types,
 				Model:           model,
-				ClientIP:        r.RemoteAddr,
+				ClientIP:        clientIP(r),
 				Details:         "Extension prompt blocked by entity DLP policy",
 			})
 		}
@@ -577,6 +617,15 @@ func (s *Server) handleAuthVerify(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// effectiveGlobalProxyKey resolves the key that must be active after a reload:
+// the stored value when set, otherwise the boot/env key (explicit clear).
+func (s *Server) effectiveGlobalProxyKey(cfg config.DynamicConfig) string {
+	if key := strings.TrimSpace(cfg.GlobalProxyKey); key != "" {
+		return key
+	}
+	return s.bootProxyKey
+}
+
 func (s *Server) reloadGateway(ctx context.Context) error {
 	if s.store == nil || s.gateway == nil {
 		return nil
@@ -630,7 +679,7 @@ func (s *Server) reloadGateway(ctx context.Context) error {
 		}
 	}
 
-	s.gateway.UpdateDynamicConfig(dynCfg.EntityActions, tenantKeys, tenantPolicies, tenantRateLimits, s.defaultRateLimit, dynCfg.GlobalProxyKey)
+	s.gateway.UpdateDynamicConfig(dynCfg.EntityActions, tenantKeys, tenantPolicies, tenantRateLimits, s.defaultRateLimit, s.effectiveGlobalProxyKey(dynCfg))
 	s.gateway.SetTenantNames(tenantNames)
 	s.gateway.UpdateThresholds(dynCfg.FamilyThresholds, dynCfg.EntityThresholds)
 
@@ -676,7 +725,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		cfg, err := s.store.GetDynamicConfig(r.Context())
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 		globalConfigured := cfg.GlobalProxyKey != ""
@@ -702,7 +751,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.store.SaveDynamicConfig(r.Context(), newCfg); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
@@ -815,7 +864,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		tenants, err := s.store.ListTenants(r.Context())
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 		if tenants == nil {
@@ -838,7 +887,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 		}
 		savedTenant, err := s.store.SaveTenant(r.Context(), tenant)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
@@ -866,7 +915,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 			origID = payload.ID
 		}
 		if err := s.store.UpdateTenant(r.Context(), origID, payload.TenantConfig); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 
@@ -900,7 +949,7 @@ func (s *Server) handleTenants(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.store.DeleteTenant(r.Context(), id); err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+			writeJSONError(w, http.StatusInternalServerError, "server_error", err.Error())
 			return
 		}
 

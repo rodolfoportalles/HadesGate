@@ -13,7 +13,7 @@ RUN npm run build
 # ==============================================================================
 # STAGE 2: Build the High-Performance Go Binary (CGO_ENABLED=0 + Pure-Go SQLite)
 # ==============================================================================
-FROM golang:1.27.3-alpine AS go-builder
+FROM golang:1.27.4-alpine AS go-builder
 WORKDIR /app
 
 COPY go.mod go.sum ./

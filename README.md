@@ -137,7 +137,7 @@ docker run -d --name hadesgate -p 8080:8080 \
 ### A partir do código-fonte
 
 ```bash
-# Requer Go 1.27.3+ e Node 20+
+# Requer Go 1.27.4+ e Node 20+
 cd frontend && npm install && npm run build && cd ..
 # copie frontend/out para internal/web/dist (veja o Makefile)
 CGO_ENABLED=0 go build -o hadesgate ./cmd/hadesgate

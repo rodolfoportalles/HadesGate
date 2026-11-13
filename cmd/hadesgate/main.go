@@ -24,6 +24,9 @@ import (
 
 func main() {
 	cfg := config.Load()
+	// Capture the boot/env proxy key before the stored configuration below can
+	// replace it: clearing the stored key must revert to this one.
+	bootProxyKey := cfg.ProxyKey
 	configMasterKey, keyErr := config.ParseMasterKey(cfg.ConfigMasterKey)
 	if keyErr != nil {
 		log.Fatalf("configuration encryption unavailable: %v", keyErr)
@@ -200,6 +203,9 @@ func main() {
 		Engine:                      engine,
 		Webhook:                     webhookDisp,
 	})
+	// Webhooks leave the process too: reuse the proxy address policy so
+	// private hosts stay reachable while metadata and redirects are refused.
+	webhookDisp.SetTransport(upstream.EgressTransport())
 
 	// 7. Initialize Gateway Proxy Handler
 	gateway := proxy.NewGatewayWithOptions(engine, upstream, traceLogger, proxy.GatewayOptions{
@@ -230,6 +236,8 @@ func main() {
 	webServer.SetUpstream(upstream)
 	webServer.SetProviderFingerprintSecret(cfg.ProviderFingerprintSecret)
 	webServer.SetDefaultRateLimit(cfg.RateLimitPerMinute)
+	webServer.SetBootProxyKey(bootProxyKey)
+	webServer.SetAdminRateLimit(cfg.AdminRateLimit)
 	securityPolicy := web.NewSecurityPolicy(cfg.CORSAllowedOrigins)
 	webServer.SetSecurityPolicy(securityPolicy)
 
@@ -259,11 +267,12 @@ func main() {
 	handler := securityPolicy.Handler(mux)
 
 	server := &http.Server{
-		Addr:         net.JoinHostPort(cfg.BindAddress, strconv.Itoa(cfg.Port)),
-		Handler:      handler,
-		ReadTimeout:  120 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              net.JoinHostPort(cfg.BindAddress, strconv.Itoa(cfg.Port)),
+		Handler:           handler,
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown listener

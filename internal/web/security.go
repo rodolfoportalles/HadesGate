@@ -74,7 +74,7 @@ func (p *SecurityPolicy) serveHTTP(next http.Handler, cfg *securityConfig, w htt
 
 	if allowed {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Upstream-Url, X-Upstream-Key, X-API-Key, X-Goog-Api-Key, Anthropic-Version")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Upstream-Url, X-Upstream-Key, X-API-Key, X-Goog-Api-Key, X-HadesGate-Tenant, Anthropic-Version")
 		if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
 			w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		}
