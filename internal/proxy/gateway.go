@@ -328,18 +328,18 @@ func (g *Gateway) authenticateTenant(r *http.Request) (string, bool) {
 	}
 
 	// 1. Authenticate only against the global proxy key or tenant proxy keys.
+	// When the request carries an explicit tenant path, the authenticated
+	// credential selects that path tenant: the URL names the policy and the
+	// telemetry tenant, so it must not silently fall back to the key's owner.
 	for _, key := range gatewayKeys {
-		if tenant, ok := g.AuthenticateKey(key); ok {
-			if pathTenant != "" {
-				g.mu.RLock()
-				expectedKey := g.tenantKeys[pathTenant]
-				g.mu.RUnlock()
-				if tenant == "default" || (expectedKey != "" && subtle.ConstantTimeCompare([]byte(key), []byte(expectedKey)) == 1) {
-					return pathTenant, true
-				}
-			}
-			return tenant, true
+		tenant, ok := g.AuthenticateKey(key)
+		if !ok {
+			continue
 		}
+		if pathTenant != "" {
+			return pathTenant, true
+		}
+		return tenant, true
 	}
 
 	// 2. Transparent BYOK mode: authenticate the tenant by a keyed fingerprint

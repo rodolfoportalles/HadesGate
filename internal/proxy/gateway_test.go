@@ -989,6 +989,71 @@ func TestGatewayWebhookOnBlock(t *testing.T) {
 	}
 }
 
+func TestGateway_TenantPathRequiresMatchingTenantKey(t *testing.T) {
+	memVault := vault.NewMemoryVault(time.Minute)
+	defer memVault.Close()
+	engine := anonymizer.NewEngine(anonymizer.DefaultConfig(), memVault)
+	traces := observability.NewTraceLogger(100)
+
+	gw := NewGatewayWithOptions(engine, nil, traces, GatewayOptions{
+		GlobalProxyKey: "sec_HG_global_test_key",
+		EntityActions: map[string]string{
+			"CPF": "mask",
+		},
+		TenantKeys: map[string]string{
+			"01": "sec_HG_alpha",
+			"02": "sec_HG_beta",
+		},
+		TenantEntityActions: map[string]map[string]string{
+			"01": {"CPF": "block"},
+			"02": {"CPF": "disabled"},
+		},
+	})
+
+	body := `{"model":"mock","messages":[{"role":"user","content":"CPF 529.982.247-25"}]}`
+	call := func(path, key string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
+		w := httptest.NewRecorder()
+		gw.HandleTenantPath(w, req)
+		return w
+	}
+
+	// A key of tenant 01 on tenant 02's path must use tenant 02's policy
+	// (CPF disabled), not return 400 from tenant 01's block rule.
+	if w := call("/t/02/v1/chat/completions", "sec_HG_alpha"); w.Code != http.StatusOK {
+		t.Fatalf("tenant 01 key on tenant 02 path: expected 200 with tenant 02 policy, got %d: %s", w.Code, w.Body.String())
+	}
+	if got, _ := traces.GetPagedForTenant("02", 10, 0); len(got) != 1 {
+		t.Fatalf("expected the request to be traced under tenant 02, got %d traces", len(got))
+	}
+	if got, _ := traces.GetPagedForTenant("01", 10, 0); len(got) != 0 {
+		t.Fatalf("expected no trace under tenant 01, got %d", len(got))
+	}
+
+	// The legitimate key keeps working.
+	if w := call("/t/02/v1/chat/completions", "sec_HG_beta"); w.Code != http.StatusOK {
+		t.Fatalf("tenant 02 key: expected 200, got %d", w.Code)
+	}
+
+	// The reverse direction must keep tenant 01's block policy.
+	if w := call("/t/01/v1/chat/completions", "sec_HG_beta"); w.Code != http.StatusBadRequest {
+		t.Fatalf("tenant 02 key on tenant 01 path: expected 400, got %d", w.Code)
+	}
+
+	// The global key stays allowed on every tenant path.
+	if w := call("/t/02/v1/chat/completions", "sec_HG_global_test_key"); w.Code != http.StatusOK {
+		t.Fatalf("global key on tenant path: expected 200, got %d", w.Code)
+	}
+
+	// Unknown credentials are still rejected.
+	if w := call("/t/02/v1/chat/completions", "sec_HG_unknown"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("unknown key: expected 401, got %d", w.Code)
+	}
+}
+
 func TestGateway_TenantPathAndPassthrough(t *testing.T) {
 	memVault := vault.NewMemoryVault(time.Minute)
 	defer memVault.Close()
